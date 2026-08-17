@@ -1,17 +1,17 @@
-# @deepseek-ai/dsh-remote-app
+# @firefly0621/dsh-remote-app
 
 PWA for remote dsh control: pair once with a QR scan or a 6-digit code, browse the plugin inventory, and view settings — all over the shared remote-control protocol. It is a plain Vite static site with no framework; the phone browser's "add to home screen" makes it app-like.
 
 ## Run
 
 ```sh
-pnpm --filter @deepseek-ai/dsh-remote-app dev
+pnpm --filter @firefly0621/dsh-remote-app dev
 ```
 
 ## Deploy
 
 ```sh
-pnpm --filter @deepseek-ai/dsh-remote-app build
+pnpm --filter @firefly0621/dsh-remote-app build
 # serve apps/remote-app/dist from any static host, ideally HTTPS so the browser
 # can reach the WSS relay
 ```

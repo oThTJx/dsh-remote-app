@@ -1,6 +1,6 @@
 # @deepseek-ai/dsh-remote-app
 
-PWA for remote dsh control: pair with a 6-digit code, browse the plugin inventory, and view settings — all over the shared remote-control protocol. It is a plain Vite static site with no framework; the phone browser's "add to home screen" makes it app-like.
+PWA for remote dsh control: pair once with a QR scan or a 6-digit code, browse the plugin inventory, and view settings — all over the shared remote-control protocol. It is a plain Vite static site with no framework; the phone browser's "add to home screen" makes it app-like.
 
 ## Run
 
@@ -18,8 +18,8 @@ pnpm --filter @deepseek-ai/dsh-remote-app build
 
 ## Flow
 
-1. Enter the relay URL (`wss://relay.example.com`) and the 6-digit pairing code shown in the dsh terminal.
-2. The app pairs with the device and shows the plugin inventory.
-3. Settings are read-only for now (JSON view); editing arrives with the settings form renderer.
+1. Open the app: it auto-resumes a previously paired session from its stored token; otherwise it shows the pairing screen.
+2. Pair once — tap **扫码连接** to scan the QR shown in the host's 设置 → 插件 → 远程控制 panel, or enter the relay URL and the 6-digit code manually.
+3. The app shows the plugin inventory; the settings tab renders every namespace as a JSON view (editing is not implemented yet).
 
-The pairing token lives in memory only — refreshing the page requires re-pairing.
+The pairing token is kept in `localStorage`, so refreshing or reopening the app resumes the session without re-pairing. Re-pair only becomes necessary when the host removes the device (设置 → 插件 → 远程控制 → 已配对设备), resets its identity, or the relay loses its persisted sessions (`DSH_RELAY_DATA_DIR` not set and restarted).

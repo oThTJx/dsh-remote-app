@@ -1,0 +1,264 @@
+import { parseMessage, serializeMessage, type Envelope } from '@firefly0621/dsh-remote-protocol'
+import jsQR from 'jsqr'
+import { parseQrPayload } from './qr-payload.ts'
+import './style.css'
+
+/** Resolve a required element of type T or throw — the DOM is static here. */
+function requireElement<T extends HTMLElement>(selector: string, constructor: new () => T): T {
+  const element = document.querySelector(selector)
+  if (element === null || !(element instanceof constructor)) {
+    throw new Error(`missing element: ${selector}`)
+  }
+  return element
+}
+
+const app = requireElement<HTMLElement>('#app', HTMLElement)
+
+interface Session {
+  socket: WebSocket
+  token: string
+  deviceId: string
+}
+
+/** Persisted connection: a paired phone resumes with its token, no re-scan. */
+interface StoredConnection {
+  relay: string
+  token: string
+}
+
+const CONNECTION_KEY = 'dsh-remote.connection'
+
+let session: Session | undefined
+
+function render(html: string): void {
+  app.innerHTML = html
+}
+
+function nextMessage(socket: WebSocket, match: (message: Envelope) => boolean): Promise<Envelope> {
+  return new Promise((resolve, reject) => {
+    const handler = (event: MessageEvent): void => {
+      let message: Envelope
+      try {
+        message = parseMessage(String(event.data))
+      } catch {
+        return
+      }
+      if (match(message)) {
+        socket.removeEventListener('message', handler)
+        resolve(message)
+      }
+    }
+    socket.addEventListener('message', handler)
+    socket.addEventListener('error', () => { reject(new Error('websocket error')) }, { once: true })
+  })
+}
+
+async function request(method: string, params: unknown): Promise<unknown> {
+  if (session === undefined) throw new Error('未连接')
+  const id = crypto.randomUUID()
+  session.socket.send(serializeMessage({
+    type: 'request',
+    id,
+    deviceId: session.deviceId,
+    payload: { token: session.token, method, params },
+  }))
+  const reply = await nextMessage(
+    session.socket,
+    message => message.id === id && (message.type === 'response' || message.type === 'error'),
+  )
+  if (reply.type === 'error') throw new Error((reply.payload as { message: string }).message)
+  return (reply.payload as { result: unknown }).result
+}
+
+/** Open a socket, send one message, and resolve the first matching reply. */
+async function connectAndExchange(
+  relay: string,
+  send: (socket: WebSocket) => void,
+): Promise<{ socket: WebSocket; reply: Envelope }> {
+  const socket = new WebSocket(relay)
+  await new Promise<void>((resolve, reject) => {
+    socket.addEventListener('open', () => { resolve() })
+    socket.addEventListener('error', () => { reject(new Error('无法连接中继')) })
+  })
+  send(socket)
+  const reply = await nextMessage(
+    socket,
+    message => message.type === 'pair-result' || message.type === 'error',
+  )
+  return { socket, reply }
+}
+
+/** Scan a QR with the rear camera; resolve the decoded payload once. */
+async function scanQr(): Promise<{ relay: string; code: string }> {
+  const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } })
+  try {
+    const video = document.createElement('video')
+    video.srcObject = stream
+    video.play()
+    const videoContainer = requireElement<HTMLElement>('#scanner', HTMLElement)
+    videoContainer.replaceChildren(video)
+    return await new Promise<{ relay: string; code: string }>((resolve, _reject) => {
+      const scan = (): void => {
+        if (video.readyState === video.HAVE_ENOUGH_DATA) {
+          const canvas = document.createElement('canvas')
+          canvas.width = video.videoWidth
+          canvas.height = video.videoHeight
+          const context = canvas.getContext('2d', { willReadFrequently: true })
+          if (context !== null) {
+            context.drawImage(video, 0, 0)
+            const result = jsQR(
+              context.getImageData(0, 0, canvas.width, canvas.height).data,
+              canvas.width,
+              canvas.height,
+            )
+            if (result !== null) {
+              try {
+                resolve(parseQrPayload(result.data))
+                return
+              } catch {
+                // Not our payload; keep scanning.
+              }
+            }
+          }
+        }
+        requestAnimationFrame(scan)
+      }
+      requestAnimationFrame(scan)
+    })
+  } finally {
+    stream.getTracks().forEach((track) => { track.stop() })
+  }
+}
+
+function pairScreen(): void {
+  render(`
+    <h1>远程控制 dsh</h1>
+    <p>在电脑上打开 设置 → 插件 → 远程控制，扫码或输入配对码。</p>
+    <button id="scan">扫码连接</button>
+    <div id="scanner"></div>
+    <input id="relay" placeholder="中继地址 wss://…" value="${localStorage.getItem('relay') ?? ''}" />
+    <input id="code" placeholder="6 位配对码" inputmode="numeric" maxlength="6" />
+    <button id="pair">连接</button>
+    <p id="status"></p>
+  `)
+  const status = requireElement<HTMLElement>('#status', HTMLElement)
+
+  const connect = (relay: string, code: string): void => {
+    void (async () => {
+      if (relay.length === 0 || code.length !== 6) {
+        status.textContent = '请填写中继地址和 6 位配对码'
+        return
+      }
+      localStorage.setItem('relay', relay)
+      status.textContent = '连接中…'
+      const { socket, reply } = await connectAndExchange(relay, (socket) => {
+        socket.send(serializeMessage({ type: 'pair', payload: { pairingCode: code } }))
+      })
+      if (reply.type === 'error') {
+        status.textContent = (reply.payload as { message: string }).message
+        socket.close()
+        return
+      }
+      const payload = reply.payload as { token: string; deviceId: string }
+      localStorage.setItem(CONNECTION_KEY, JSON.stringify({ relay, token: payload.token } satisfies StoredConnection))
+      session = { socket, token: payload.token, deviceId: payload.deviceId }
+      void inventoryScreen()
+    })()
+  }
+
+  requireElement<HTMLButtonElement>('#pair', HTMLButtonElement).addEventListener('click', () => {
+    connect(
+      requireElement<HTMLInputElement>('#relay', HTMLInputElement).value.trim(),
+      requireElement<HTMLInputElement>('#code', HTMLInputElement).value.trim(),
+    )
+  })
+  requireElement<HTMLButtonElement>('#scan', HTMLButtonElement).addEventListener('click', () => {
+    status.textContent = '正在打开摄像头…'
+    void scanQr().then(
+      ({ relay, code }) => {
+        requireElement<HTMLInputElement>('#relay', HTMLInputElement).value = relay
+        requireElement<HTMLInputElement>('#code', HTMLInputElement).value = code
+        connect(relay, code)
+      },
+      () => { status.textContent = '无法打开摄像头或未识别到二维码' },
+    )
+  })
+}
+
+/** Resume a stored session: connect and present the token instead of pairing. */
+function resume(): void {
+  const raw = localStorage.getItem(CONNECTION_KEY)
+  if (raw === null) {
+    pairScreen()
+    return
+  }
+  let stored: StoredConnection
+  try {
+    stored = JSON.parse(raw) as StoredConnection
+  } catch {
+    localStorage.removeItem(CONNECTION_KEY)
+    pairScreen()
+    return
+  }
+  render('<h1>正在恢复连接…</h1><p id="status"></p>')
+  const status = requireElement<HTMLElement>('#status', HTMLElement)
+  void connectAndExchange(stored.relay, (socket) => {
+    socket.send(serializeMessage({ type: 'resume', payload: { token: stored.token } }))
+  }).then(
+    ({ socket, reply }) => {
+      if (reply.type === 'error') {
+        // The token was revoked or the relay lost it; pair again.
+        localStorage.removeItem(CONNECTION_KEY)
+        socket.close()
+        pairScreen()
+        return
+      }
+      const payload = reply.payload as { token: string; deviceId: string }
+      session = { socket, token: payload.token, deviceId: payload.deviceId }
+      void inventoryScreen()
+    },
+    () => {
+      status.textContent = '无法连接中继'
+      pairScreen()
+    },
+  )
+}
+
+async function inventoryScreen(): Promise<void> {
+  const result = await request('plugin.list', {}) as {
+    entries: Array<{ entryId: string; moduleName: string; enabled: boolean; fiberPhase: string | null }>
+  }
+  render(`
+    <h1>插件清单</h1>
+    <ul>
+      ${result.entries.map(entry => `
+        <li>
+          <strong>${entry.moduleName}</strong>
+          <span>${entry.enabled ? '已启用' : '已禁用'}</span>
+        </li>`).join('')}
+    </ul>
+    <button id="settings">打开设置</button>
+    <button id="back">重新配对</button>
+  `)
+  requireElement<HTMLButtonElement>('#settings', HTMLButtonElement).addEventListener('click', () => { void settingsScreen() })
+  requireElement<HTMLButtonElement>('#back', HTMLButtonElement).addEventListener('click', () => {
+    session?.socket.close()
+    session = undefined
+    localStorage.removeItem(CONNECTION_KEY)
+    pairScreen()
+  })
+}
+
+async function settingsScreen(): Promise<void> {
+  const result = await request('settings.describe', {}) as {
+    namespaces: Array<{ ns: string; schema: unknown; value: unknown }>
+  }
+  render(`
+    <h1>设置</h1>
+    <pre>${JSON.stringify(result.namespaces, null, 2)}</pre>
+    <button id="back">返回</button>
+  `)
+  requireElement<HTMLButtonElement>('#back', HTMLButtonElement).addEventListener('click', () => { void inventoryScreen() })
+}
+
+resume()

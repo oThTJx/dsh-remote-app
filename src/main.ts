@@ -336,7 +336,9 @@ async function conversationScreen(sessionId: string): Promise<void> {
   const renderLog = (): void => {
     log.innerHTML = messages.map((message) => {
       if (message.role === 'tool') {
-        return `<p class="chat-tool"><strong>工具 ${escapeHtml(message.name)}</strong> ${message.error === undefined ? '' : `（失败: ${escapeHtml(message.error)}）`}</p>`
+        const state = message.error === undefined ? '' : `（失败: ${escapeHtml(message.error)}）`
+        const detail = message.result === undefined ? '' : `<br>${escapeHtml(message.result)}`
+        return `<p class="chat-tool"><strong>工具 ${escapeHtml(message.name)}</strong>${state}${detail}</p>`
       }
       return `<p class="chat-${message.role}"><strong>${message.role === 'user' ? '我' : 'dsh'}</strong> ${escapeHtml(message.text)}</p>`
     }).join('')

@@ -287,7 +287,7 @@ async function sessionsScreen(): Promise<void> {
   }
   requireElement<HTMLButtonElement>('#create-session', HTMLButtonElement).addEventListener('click', () => {
     void request('sessions.create', {}).then(
-      ({ sessionId }) => { void conversationScreen(sessionId) },
+      (result) => { const { sessionId } = result as { sessionId: string }; void conversationScreen(sessionId) },
       (error: unknown) => { render(`<p>创建失败: ${escapeHtml(error instanceof Error ? error.message : String(error))}</p><button id="back">返回</button>`); document.querySelector('#back')?.addEventListener('click', () => { void sessionsScreen() }) },
     )
   })

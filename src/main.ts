@@ -310,13 +310,27 @@ async function conversationScreen(sessionId: string): Promise<void> {
 
   const history = await request('chat.history', { sessionId }) as { messages: typeof messages }
   messages.push(...history.messages)
+  const catalog = await request('models.list', {}) as {
+    groups: Array<{ provider: string; models: string[] }>
+    current?: { provider: string; model: string }
+  }
+  const modelOptions = catalog.groups.flatMap(group => group.models.map(model => `${group.provider}/${model}`))
+  const currentModel = catalog.current === undefined ? '' : `${catalog.current.provider}/${catalog.current.model}`
   render(`
     <h1>会话 ${escapeHtml(sessionId.slice(0, 8))}…</h1>
+    <select id="model-select">
+      ${modelOptions.map(option => `<option value="${escapeHtml(option)}"${option === currentModel ? ' selected' : ''}>${escapeHtml(option)}</option>`).join('')}
+    </select>
     <div id="chat-log"></div>
     <input id="chat-input" placeholder="输入消息…" />
     <button id="chat-send">发送</button>
     <button id="back">返回</button>
   `)
+  requireElement<HTMLSelectElement>('#model-select', HTMLSelectElement).addEventListener('change', (event) => {
+    const [provider, model] = (event.target as HTMLSelectElement).value.split('/')
+    if (provider === undefined || model === undefined) return
+    void request('models.set', { sessionId, provider, model }).catch(() => { /* selection is advisory */ })
+  })
 
   const log = requireElement<HTMLElement>('#chat-log', HTMLElement)
   const renderLog = (): void => {

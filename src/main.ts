@@ -305,7 +305,7 @@ let chatListener: ((event: MessageEvent) => void) | undefined
 async function conversationScreen(sessionId: string): Promise<void> {
   if (session === undefined) { pairScreen(); return }
   const socket = session.socket
-  const messages: Array<{ role: 'user' | 'assistant'; text: string } | { role: 'tool'; name: string; error?: string }> = []
+  const messages: Array<{ role: 'user' | 'assistant'; text: string } | { role: 'tool'; name: string; error?: string; result?: string }> = []
   let streaming = false
 
   const history = await request('chat.history', { sessionId }) as { messages: typeof messages }

@@ -22,6 +22,6 @@ pnpm --filter @firefly0621/dsh-remote-app build
 
 1. Open the app: it auto-resumes a previously paired session from its stored token; otherwise it shows the pairing screen.
 2. Pair once — tap **扫码连接** to scan the QR shown in the host's 设置 → 插件 → 远程控制 panel, or enter the relay URL and the 6-digit code manually.
-3. The app shows the plugin inventory; the settings tab renders every namespace as a JSON view (editing is not implemented yet).
+3. The app shows the plugin inventory; the chat tab sends messages to the host's most recent active session and streams the assistant reply live; the settings tab renders every namespace as a JSON view (editing is not implemented yet).
 
 The pairing token is kept in `localStorage`, so refreshing or reopening the app resumes the session without re-pairing. Re-pair only becomes necessary when the host removes the device (设置 → 插件 → 远程控制 → 已配对设备), resets its identity, or the relay loses its persisted sessions (`DSH_RELAY_DATA_DIR` not set and restarted).

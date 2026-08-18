@@ -30,3 +30,18 @@ ul {
 li {
   margin: 0.25rem 0;
 }
+
+#chat-log {
+  border: 1px solid #ccc;
+  padding: 8px;
+  height: 55vh;
+  overflow-y: auto;
+}
+#chat-log p {
+  margin: 4px 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.chat-user { color: #0a58ca; }
+.chat-assistant { color: #1a1a1a; }
+#chat-input { width: 100%; box-sizing: border-box; }

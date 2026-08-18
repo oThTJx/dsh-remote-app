@@ -1,7 +1,7 @@
 {
   "name": "@firefly0621/dsh-remote-app",
   "description": "PWA for remote dsh control: scan a QR or pair with a code, browse plugins, edit settings",
-  "version": "0.1.0-rc.9",
+  "version": "0.1.0-rc.10",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/oThTJx/dsh-remote-app.git"

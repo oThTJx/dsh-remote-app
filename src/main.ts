@@ -237,15 +237,103 @@ async function inventoryScreen(): Promise<void> {
           <span>${entry.enabled ? '已启用' : '已禁用'}</span>
         </li>`).join('')}
     </ul>
+    <button id="chat">打开聊天</button>
     <button id="settings">打开设置</button>
     <button id="back">重新配对</button>
   `)
+  requireElement<HTMLButtonElement>('#chat', HTMLButtonElement).addEventListener('click', () => { void chatScreen() })
   requireElement<HTMLButtonElement>('#settings', HTMLButtonElement).addEventListener('click', () => { void settingsScreen() })
   requireElement<HTMLButtonElement>('#back', HTMLButtonElement).addEventListener('click', () => {
     session?.socket.close()
     session = undefined
     localStorage.removeItem(CONNECTION_KEY)
     pairScreen()
+  })
+}
+
+function escapeHtml(text: string): string {
+  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+}
+
+/** Persistent socket listener while the chat screen is open; removed on leave. */
+let chatListener: ((event: MessageEvent) => void) | undefined
+
+/** One chat tab: send messages and stream the assistant reply via `event` pushes. */
+async function chatScreen(): Promise<void> {
+  if (session === undefined) { pairScreen(); return }
+  const socket = session.socket
+  const messages: Array<{ role: 'user' | 'assistant'; text: string }> = []
+  let streaming = false
+
+  render(`
+    <h1>聊天</h1>
+    <div id="chat-log"></div>
+    <input id="chat-input" placeholder="输入消息…" />
+    <button id="chat-send">发送</button>
+    <button id="back">返回</button>
+  `)
+
+  const log = requireElement<HTMLElement>('#chat-log', HTMLElement)
+  const renderLog = (): void => {
+    log.innerHTML = messages.map(message => `
+      <p class="chat-${message.role}"><strong>${message.role === 'user' ? '我' : 'dsh'}</strong> ${escapeHtml(message.text)}</p>
+    `).join('')
+    log.scrollTop = log.scrollHeight
+  }
+
+  chatListener = (event: MessageEvent): void => {
+    let message: Envelope
+    try {
+      message = parseMessage(String(event.data))
+    } catch {
+      return
+    }
+    if (message.type !== 'event') return
+    const { event: name, payload } = message.payload as {
+      event: string
+      payload: { text?: string; code?: string; message?: string }
+    }
+    if (name === 'chat/start') {
+      messages.push({ role: 'assistant', text: '' })
+      streaming = true
+      renderLog()
+    } else if (name === 'chat/chunk' || name === 'chat/done') {
+      const last = messages[messages.length - 1]
+      if (last !== undefined && last.role === 'assistant') {
+        last.text = name === 'chat/done' ? (payload.text ?? last.text) : last.text + (payload.text ?? '')
+      }
+      if (name === 'chat/done') streaming = false
+      renderLog()
+    } else if (name === 'chat/error') {
+      const last = messages[messages.length - 1]
+      if (last !== undefined && last.role === 'assistant') last.text = `错误: ${payload.message ?? payload.code ?? '未知'}`
+      streaming = false
+      renderLog()
+    }
+  }
+  socket.addEventListener('message', chatListener)
+
+  const send = (): void => {
+    const input = requireElement<HTMLInputElement>('#chat-input', HTMLInputElement)
+    const text = input.value.trim()
+    if (text.length === 0 || streaming) return
+    messages.push({ role: 'user', text })
+    input.value = ''
+    renderLog()
+    void request('chat.send', { text }).catch((error: unknown) => {
+      messages.push({ role: 'assistant', text: `发送失败: ${error instanceof Error ? error.message : String(error)}` })
+      renderLog()
+    })
+  }
+
+  requireElement<HTMLButtonElement>('#chat-send', HTMLButtonElement).addEventListener('click', send)
+  requireElement<HTMLInputElement>('#chat-input', HTMLInputElement).addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') send()
+  })
+  requireElement<HTMLButtonElement>('#back', HTMLButtonElement).addEventListener('click', () => {
+    if (chatListener !== undefined) socket.removeEventListener('message', chatListener)
+    chatListener = undefined
+    void inventoryScreen()
   })
 }
 

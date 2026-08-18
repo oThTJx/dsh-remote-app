@@ -46,3 +46,4 @@ li {
 .chat-assistant { color: #1a1a1a; }
 #chat-input { width: 100%; box-sizing: border-box; }
 .chat-tool { color: #6c757d; font-size: 0.85em; }
+.chat-stats { color: #6c757d; font-size: 0.8em; margin: 0 0 4px; }

@@ -316,8 +316,15 @@ async function conversationScreen(sessionId: string): Promise<void> {
   }
   const modelOptions = catalog.groups.flatMap(group => group.models.map(model => `${group.provider}/${model}`))
   const currentModel = catalog.current === undefined ? '' : `${catalog.current.provider}/${catalog.current.model}`
+  const statsResult = await request('chat.stats', { sessionId }) as {
+    stats: { turns: number; steps: number; decodeTokens: number } | null
+  }
+  const statsLine = statsResult.stats === null
+    ? ''
+    : `<p class="chat-stats">轮次 ${statsResult.stats.turns} · 步骤 ${statsResult.stats.steps} · 输出 ${statsResult.stats.decodeTokens} tokens</p>`
   render(`
     <h1>会话 ${escapeHtml(sessionId.slice(0, 8))}…</h1>
+    ${statsLine}
     <select id="model-select">
       ${modelOptions.map(option => `<option value="${escapeHtml(option)}"${option === currentModel ? ' selected' : ''}>${escapeHtml(option)}</option>`).join('')}
     </select>

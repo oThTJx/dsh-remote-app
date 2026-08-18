@@ -258,20 +258,33 @@ function escapeHtml(text: string): string {
 /** Persistent socket listener while the chat screen is open; removed on leave. */
 let chatListener: ((event: MessageEvent) => void) | undefined
 
-/** One chat tab: send messages and stream the assistant reply via `event` pushes. */
+/** One chat tab: pick a session, send messages, and stream the assistant reply via `event` pushes. */
 async function chatScreen(): Promise<void> {
   if (session === undefined) { pairScreen(); return }
   const socket = session.socket
   const messages: Array<{ role: 'user' | 'assistant'; text: string }> = []
   let streaming = false
+  let currentSessionId: string | undefined
 
+  const sessionsResult = await request('chat.sessions', {}) as {
+    sessions: Array<{ sessionId: string; seq: number }>
+  }
   render(`
     <h1>聊天</h1>
+    <select id="chat-session">
+      ${sessionsResult.sessions.map(item => `
+        <option value="${item.sessionId}">会话 ${item.sessionId.slice(0, 8)}…</option>`).join('')}
+    </select>
     <div id="chat-log"></div>
     <input id="chat-input" placeholder="输入消息…" />
     <button id="chat-send">发送</button>
     <button id="back">返回</button>
   `)
+  const sessionSelect = requireElement<HTMLSelectElement>('#chat-session', HTMLSelectElement)
+  currentSessionId = sessionSelect.value === '' ? undefined : sessionSelect.value
+  sessionSelect.addEventListener('change', () => {
+    currentSessionId = sessionSelect.value === '' ? undefined : sessionSelect.value
+  })
 
   const log = requireElement<HTMLElement>('#chat-log', HTMLElement)
   const renderLog = (): void => {
@@ -320,10 +333,11 @@ async function chatScreen(): Promise<void> {
     messages.push({ role: 'user', text })
     input.value = ''
     renderLog()
-    void request('chat.send', { text }).catch((error: unknown) => {
-      messages.push({ role: 'assistant', text: `发送失败: ${error instanceof Error ? error.message : String(error)}` })
-      renderLog()
-    })
+    void request('chat.send', { text, ...(currentSessionId === undefined ? {} : { sessionId: currentSessionId }) })
+      .catch((error: unknown) => {
+        messages.push({ role: 'assistant', text: `发送失败: ${error instanceof Error ? error.message : String(error)}` })
+        renderLog()
+      })
   }
 
   requireElement<HTMLButtonElement>('#chat-send', HTMLButtonElement).addEventListener('click', send)

@@ -237,11 +237,11 @@ async function inventoryScreen(): Promise<void> {
           <span>${entry.enabled ? '已启用' : '已禁用'}</span>
         </li>`).join('')}
     </ul>
-    <button id="chat">打开聊天</button>
+    <button id="sessions">打开会话</button>
     <button id="settings">打开设置</button>
     <button id="back">重新配对</button>
   `)
-  requireElement<HTMLButtonElement>('#chat', HTMLButtonElement).addEventListener('click', () => { void chatScreen() })
+  requireElement<HTMLButtonElement>('#sessions', HTMLButtonElement).addEventListener('click', () => { void sessionsScreen() })
   requireElement<HTMLButtonElement>('#settings', HTMLButtonElement).addEventListener('click', () => { void settingsScreen() })
   requireElement<HTMLButtonElement>('#back', HTMLButtonElement).addEventListener('click', () => {
     session?.socket.close()
@@ -251,46 +251,81 @@ async function inventoryScreen(): Promise<void> {
   })
 }
 
+/** Session list: open a conversation, create a new session, or delete one the phone created. */
+async function sessionsScreen(): Promise<void> {
+  const list = await request('sessions.list', {}) as {
+    sessions: Array<{ sessionId: string; title: string; seq: number }>
+  }
+  render(`
+    <h1>会话</h1>
+    <ul id="session-list">
+      ${list.sessions.map(item => `
+        <li>
+          <button class="session-open" data-id="${item.sessionId}">${escapeHtml(item.title)}</button>
+          <button class="session-delete" data-id="${item.sessionId}">删除</button>
+        </li>`).join('')}
+    </ul>
+    <button id="create-session">新建会话</button>
+    <button id="back">返回</button>
+  `)
+  for (const button of document.querySelectorAll<HTMLButtonElement>('.session-open')) {
+    button.addEventListener('click', () => {
+      const id = button.dataset.id
+      if (id !== undefined) void conversationScreen(id)
+    })
+  }
+  for (const button of document.querySelectorAll<HTMLButtonElement>('.session-delete')) {
+    button.addEventListener('click', () => {
+      const id = button.dataset.id
+      if (id !== undefined) {
+        void request('sessions.delete', { sessionId: id }).then(
+          () => { void sessionsScreen() },
+          (error: unknown) => { render(`<p>删除失败: ${escapeHtml(error instanceof Error ? error.message : String(error))}</p><button id="back">返回</button>`); document.querySelector('#back')?.addEventListener('click', () => { void sessionsScreen() }) },
+        )
+      }
+    })
+  }
+  requireElement<HTMLButtonElement>('#create-session', HTMLButtonElement).addEventListener('click', () => {
+    void request('sessions.create', {}).then(
+      ({ sessionId }) => { void conversationScreen(sessionId) },
+      (error: unknown) => { render(`<p>创建失败: ${escapeHtml(error instanceof Error ? error.message : String(error))}</p><button id="back">返回</button>`); document.querySelector('#back')?.addEventListener('click', () => { void sessionsScreen() }) },
+    )
+  })
+  requireElement<HTMLButtonElement>('#back', HTMLButtonElement).addEventListener('click', () => { void inventoryScreen() })
+}
+
 function escapeHtml(text: string): string {
   return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
 }
 
-/** Persistent socket listener while the chat screen is open; removed on leave. */
+/** Persistent socket listener while a conversation is open; removed on leave. */
 let chatListener: ((event: MessageEvent) => void) | undefined
 
-/** One chat tab: pick a session, send messages, and stream the assistant reply via `event` pushes. */
-async function chatScreen(): Promise<void> {
+/** One conversation: load history, send messages, and stream the assistant reply via `event` pushes. */
+async function conversationScreen(sessionId: string): Promise<void> {
   if (session === undefined) { pairScreen(); return }
   const socket = session.socket
-  const messages: Array<{ role: 'user' | 'assistant'; text: string }> = []
+  const messages: Array<{ role: 'user' | 'assistant'; text: string } | { role: 'tool'; name: string; error?: string }> = []
   let streaming = false
-  let currentSessionId: string | undefined
 
-  const sessionsResult = await request('chat.sessions', {}) as {
-    sessions: Array<{ sessionId: string; seq: number }>
-  }
+  const history = await request('chat.history', { sessionId }) as { messages: typeof messages }
+  messages.push(...history.messages)
   render(`
-    <h1>聊天</h1>
-    <select id="chat-session">
-      ${sessionsResult.sessions.map(item => `
-        <option value="${item.sessionId}">会话 ${item.sessionId.slice(0, 8)}…</option>`).join('')}
-    </select>
+    <h1>会话 ${escapeHtml(sessionId.slice(0, 8))}…</h1>
     <div id="chat-log"></div>
     <input id="chat-input" placeholder="输入消息…" />
     <button id="chat-send">发送</button>
     <button id="back">返回</button>
   `)
-  const sessionSelect = requireElement<HTMLSelectElement>('#chat-session', HTMLSelectElement)
-  currentSessionId = sessionSelect.value === '' ? undefined : sessionSelect.value
-  sessionSelect.addEventListener('change', () => {
-    currentSessionId = sessionSelect.value === '' ? undefined : sessionSelect.value
-  })
 
   const log = requireElement<HTMLElement>('#chat-log', HTMLElement)
   const renderLog = (): void => {
-    log.innerHTML = messages.map(message => `
-      <p class="chat-${message.role}"><strong>${message.role === 'user' ? '我' : 'dsh'}</strong> ${escapeHtml(message.text)}</p>
-    `).join('')
+    log.innerHTML = messages.map((message) => {
+      if (message.role === 'tool') {
+        return `<p class="chat-tool"><strong>工具 ${escapeHtml(message.name)}</strong> ${message.error === undefined ? '' : `（失败: ${escapeHtml(message.error)}）`}</p>`
+      }
+      return `<p class="chat-${message.role}"><strong>${message.role === 'user' ? '我' : 'dsh'}</strong> ${escapeHtml(message.text)}</p>`
+    }).join('')
     log.scrollTop = log.scrollHeight
   }
 
@@ -333,7 +368,7 @@ async function chatScreen(): Promise<void> {
     messages.push({ role: 'user', text })
     input.value = ''
     renderLog()
-    void request('chat.send', { text, ...(currentSessionId === undefined ? {} : { sessionId: currentSessionId }) })
+    void request('chat.send', { text, sessionId })
       .catch((error: unknown) => {
         messages.push({ role: 'assistant', text: `发送失败: ${error instanceof Error ? error.message : String(error)}` })
         renderLog()
@@ -347,7 +382,7 @@ async function chatScreen(): Promise<void> {
   requireElement<HTMLButtonElement>('#back', HTMLButtonElement).addEventListener('click', () => {
     if (chatListener !== undefined) socket.removeEventListener('message', chatListener)
     chatListener = undefined
-    void inventoryScreen()
+    void sessionsScreen()
   })
 }
 

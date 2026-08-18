@@ -6,6 +6,9 @@
     "type": "git",
     "url": "git+https://github.com/oThTJx/dsh-remote-app.git"
   },
+  "publishConfig": {
+    "access": "public"
+  },
   "type": "module",
   "scripts": {
     "dev": "vite",

@@ -1,5 +1,7 @@
 # @firefly0621/dsh-remote-app
 
+English | [中文](README.zh.md)
+
 PWA for remote dsh control: pair once with a QR scan or a 6-digit code, browse the plugin inventory, and view settings — all over the shared remote-control protocol. It is a plain Vite static site with no framework; the phone browser's "add to home screen" makes it app-like.
 
 ## Run

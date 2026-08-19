@@ -1,4 +1,4 @@
-import { parseMessage, serializeMessage, type Envelope } from '@firefly0621/dsh-remote-protocol'
+import { HEARTBEAT_INTERVAL_MS, parseMessage, serializeMessage, type Envelope } from '@firefly0621/dsh-remote-protocol'
 import jsQR from 'jsqr'
 import { parseQrPayload } from './qr-payload.ts'
 import './style.css'
@@ -27,16 +27,34 @@ interface StoredConnection {
 }
 
 const CONNECTION_KEY = 'dsh-remote.connection'
+/** Requests the device does not answer within this budget fail instead of hanging. */
+const REQUEST_TIMEOUT_MS = 30_000
+/** Dialing and pairing must not hang forever on a weak network. */
+const HANDSHAKE_TIMEOUT_MS = 10_000
 
 let session: Session | undefined
+let heartbeat: number | undefined
 
 function render(html: string): void {
   app.innerHTML = html
 }
 
+function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => { reject(new Error(message)) }, ms)
+    promise.then(
+      (value) => { clearTimeout(timer); resolve(value) },
+      (error: unknown) => {
+        clearTimeout(timer)
+        reject(error instanceof Error ? error : new Error(String(error)))
+      },
+    )
+  })
+}
+
 function nextMessage(socket: WebSocket, match: (message: Envelope) => boolean): Promise<Envelope> {
   return new Promise((resolve, reject) => {
-    const handler = (event: MessageEvent): void => {
+    const onMessage = (event: MessageEvent): void => {
       let message: Envelope
       try {
         message = parseMessage(String(event.data))
@@ -44,27 +62,62 @@ function nextMessage(socket: WebSocket, match: (message: Envelope) => boolean): 
         return
       }
       if (match(message)) {
-        socket.removeEventListener('message', handler)
+        cleanup()
         resolve(message)
       }
     }
-    socket.addEventListener('message', handler)
-    socket.addEventListener('error', () => { reject(new Error('websocket error')) }, { once: true })
+    const onError = (): void => { cleanup(); reject(new Error('websocket error')) }
+    const onClose = (): void => { cleanup(); reject(new Error('连接已断开')) }
+    const cleanup = (): void => {
+      socket.removeEventListener('message', onMessage)
+      socket.removeEventListener('error', onError)
+      socket.removeEventListener('close', onClose)
+    }
+    socket.addEventListener('message', onMessage)
+    socket.addEventListener('error', onError)
+    socket.addEventListener('close', onClose)
+  })
+}
+
+/** Keep an established session alive and surface an unexpected disconnect. */
+function bindSession(socket: WebSocket): void {
+  if (heartbeat !== undefined) clearInterval(heartbeat)
+  heartbeat = window.setInterval(() => {
+    if (socket.readyState === WebSocket.OPEN) socket.send(serializeMessage({ type: 'ping', payload: {} }))
+  }, HEARTBEAT_INTERVAL_MS)
+  socket.addEventListener('close', () => {
+    if (heartbeat !== undefined) { clearInterval(heartbeat); heartbeat = undefined }
+    // An intentional teardown clears `session` before closing the socket; only
+    // an unexpected drop reaches here.
+    if (session === undefined || session.socket !== socket) return
+    session = undefined
+    render('<h1>连接已断开</h1><p id="status">网络连接中断。</p><button id="reconnect">重新连接</button>')
+    requireElement<HTMLButtonElement>('#reconnect', HTMLButtonElement).addEventListener('click', () => { resume() })
   })
 }
 
 async function request(method: string, params: unknown): Promise<unknown> {
   if (session === undefined) throw new Error('未连接')
   const id = crypto.randomUUID()
-  session.socket.send(serializeMessage({
-    type: 'request',
-    id,
-    deviceId: session.deviceId,
-    payload: { token: session.token, method, params },
-  }))
-  const reply = await nextMessage(
-    session.socket,
-    message => message.id === id && (message.type === 'response' || message.type === 'error'),
+  try {
+    session.socket.send(serializeMessage({
+      type: 'request',
+      id,
+      deviceId: session.deviceId,
+      payload: { token: session.token, method, params },
+    }))
+  } catch (error) {
+    // A half-closed socket throws synchronously from send(); surface it as a
+    // rejection so callers' .catch handles it.
+    throw new Error(`发送失败: ${error instanceof Error ? error.message : String(error)}`)
+  }
+  const reply = await withTimeout(
+    nextMessage(
+      session.socket,
+      message => message.id === id && (message.type === 'response' || message.type === 'error'),
+    ),
+    REQUEST_TIMEOUT_MS,
+    '请求超时',
   )
   if (reply.type === 'error') throw new Error((reply.payload as { message: string }).message)
   return (reply.payload as { result: unknown }).result
@@ -76,16 +129,29 @@ async function connectAndExchange(
   send: (socket: WebSocket) => void,
 ): Promise<{ socket: WebSocket; reply: Envelope }> {
   const socket = new WebSocket(relay)
-  await new Promise<void>((resolve, reject) => {
-    socket.addEventListener('open', () => { resolve() })
-    socket.addEventListener('error', () => { reject(new Error('无法连接中继')) })
-  })
-  send(socket)
-  const reply = await nextMessage(
-    socket,
-    message => message.type === 'pair-result' || message.type === 'error',
-  )
-  return { socket, reply }
+  try {
+    await withTimeout(
+      new Promise<void>((resolve, reject) => {
+        socket.addEventListener('open', () => { resolve() })
+        socket.addEventListener('error', () => { reject(new Error('无法连接中继')) })
+      }),
+      HANDSHAKE_TIMEOUT_MS,
+      '连接中继超时',
+    )
+    send(socket)
+    const reply = await withTimeout(
+      nextMessage(
+        socket,
+        message => message.type === 'pair-result' || message.type === 'error',
+      ),
+      HANDSHAKE_TIMEOUT_MS,
+      '配对超时',
+    )
+    return { socket, reply }
+  } catch (error) {
+    socket.close()
+    throw error
+  }
 }
 
 /** Scan a QR with the rear camera; resolve the decoded payload once. */
@@ -136,7 +202,7 @@ function pairScreen(): void {
     <p>在电脑上打开 设置 → 插件 → 远程控制，扫码或输入配对码。</p>
     <button id="scan">扫码连接</button>
     <div id="scanner"></div>
-    <input id="relay" placeholder="中继地址 wss://…" value="${localStorage.getItem('relay') ?? ''}" />
+    <input id="relay" placeholder="中继地址 wss://…" value="${escapeHtml(localStorage.getItem('relay') ?? '')}" />
     <input id="code" placeholder="6 位配对码" inputmode="numeric" maxlength="6" />
     <button id="pair">连接</button>
     <p id="status"></p>
@@ -145,24 +211,29 @@ function pairScreen(): void {
 
   const connect = (relay: string, code: string): void => {
     void (async () => {
-      if (relay.length === 0 || code.length !== 6) {
-        status.textContent = '请填写中继地址和 6 位配对码'
-        return
+      try {
+        if (relay.length === 0 || code.length !== 6) {
+          status.textContent = '请填写中继地址和 6 位配对码'
+          return
+        }
+        localStorage.setItem('relay', relay)
+        status.textContent = '连接中…'
+        const { socket, reply } = await connectAndExchange(relay, (socket) => {
+          socket.send(serializeMessage({ type: 'pair', payload: { pairingCode: code } }))
+        })
+        if (reply.type === 'error') {
+          status.textContent = (reply.payload as { message: string }).message
+          socket.close()
+          return
+        }
+        const payload = reply.payload as { token: string; deviceId: string }
+        localStorage.setItem(CONNECTION_KEY, JSON.stringify({ relay, token: payload.token } satisfies StoredConnection))
+        session = { socket, token: payload.token, deviceId: payload.deviceId }
+        bindSession(socket)
+        void inventoryScreen()
+      } catch (error: unknown) {
+        status.textContent = error instanceof Error ? error.message : String(error)
       }
-      localStorage.setItem('relay', relay)
-      status.textContent = '连接中…'
-      const { socket, reply } = await connectAndExchange(relay, (socket) => {
-        socket.send(serializeMessage({ type: 'pair', payload: { pairingCode: code } }))
-      })
-      if (reply.type === 'error') {
-        status.textContent = (reply.payload as { message: string }).message
-        socket.close()
-        return
-      }
-      const payload = reply.payload as { token: string; deviceId: string }
-      localStorage.setItem(CONNECTION_KEY, JSON.stringify({ relay, token: payload.token } satisfies StoredConnection))
-      session = { socket, token: payload.token, deviceId: payload.deviceId }
-      void inventoryScreen()
     })()
   }
 
@@ -215,10 +286,11 @@ function resume(): void {
       }
       const payload = reply.payload as { token: string; deviceId: string }
       session = { socket, token: payload.token, deviceId: payload.deviceId }
-      void inventoryScreen()
+      bindSession(socket)
+      runScreen(inventoryScreen, resume)
     },
-    () => {
-      status.textContent = '无法连接中继'
+    (error: unknown) => {
+      status.textContent = error instanceof Error ? error.message : String(error)
       pairScreen()
     },
   )
@@ -233,7 +305,7 @@ async function inventoryScreen(): Promise<void> {
     <ul>
       ${result.entries.map(entry => `
         <li>
-          <strong>${entry.moduleName}</strong>
+          <strong>${escapeHtml(entry.moduleName)}</strong>
           <span>${entry.enabled ? '已启用' : '已禁用'}</span>
         </li>`).join('')}
     </ul>
@@ -241,8 +313,8 @@ async function inventoryScreen(): Promise<void> {
     <button id="settings">打开设置</button>
     <button id="back">重新配对</button>
   `)
-  requireElement<HTMLButtonElement>('#sessions', HTMLButtonElement).addEventListener('click', () => { void sessionsScreen() })
-  requireElement<HTMLButtonElement>('#settings', HTMLButtonElement).addEventListener('click', () => { void settingsScreen() })
+  requireElement<HTMLButtonElement>('#sessions', HTMLButtonElement).addEventListener('click', () => { runScreen(sessionsScreen, inventoryScreen) })
+  requireElement<HTMLButtonElement>('#settings', HTMLButtonElement).addEventListener('click', () => { runScreen(settingsScreen, inventoryScreen) })
   requireElement<HTMLButtonElement>('#back', HTMLButtonElement).addEventListener('click', () => {
     session?.socket.close()
     session = undefined
@@ -261,8 +333,8 @@ async function sessionsScreen(): Promise<void> {
     <ul id="session-list">
       ${list.sessions.map(item => `
         <li>
-          <button class="session-open" data-id="${item.sessionId}">${escapeHtml(item.title)}</button>
-          <button class="session-delete" data-id="${item.sessionId}">删除</button>
+          <button class="session-open" data-id="${escapeHtml(item.sessionId)}">${escapeHtml(item.title)}</button>
+          <button class="session-delete" data-id="${escapeHtml(item.sessionId)}">删除</button>
         </li>`).join('')}
     </ul>
     <button id="create-session">新建会话</button>
@@ -271,7 +343,7 @@ async function sessionsScreen(): Promise<void> {
   for (const button of document.querySelectorAll<HTMLButtonElement>('.session-open')) {
     button.addEventListener('click', () => {
       const id = button.dataset.id
-      if (id !== undefined) void conversationScreen(id)
+      if (id !== undefined) runScreen(conversationScreen.bind(null, id), sessionsScreen)
     })
   }
   for (const button of document.querySelectorAll<HTMLButtonElement>('.session-delete')) {
@@ -279,27 +351,51 @@ async function sessionsScreen(): Promise<void> {
       const id = button.dataset.id
       if (id !== undefined) {
         void request('sessions.delete', { sessionId: id }).then(
-          () => { void sessionsScreen() },
-          (error: unknown) => { render(`<p>删除失败: ${escapeHtml(error instanceof Error ? error.message : String(error))}</p><button id="back">返回</button>`); document.querySelector('#back')?.addEventListener('click', () => { void sessionsScreen() }) },
+          () => { runScreen(sessionsScreen, inventoryScreen) },
+          (error: unknown) => { failRow(`删除失败: ${error instanceof Error ? error.message : String(error)}`, () => { runScreen(sessionsScreen, inventoryScreen) }) },
         )
       }
     })
   }
   requireElement<HTMLButtonElement>('#create-session', HTMLButtonElement).addEventListener('click', () => {
     void request('sessions.create', {}).then(
-      (result) => { const { sessionId } = result as { sessionId: string }; void conversationScreen(sessionId) },
-      (error: unknown) => { render(`<p>创建失败: ${escapeHtml(error instanceof Error ? error.message : String(error))}</p><button id="back">返回</button>`); document.querySelector('#back')?.addEventListener('click', () => { void sessionsScreen() }) },
+      (result) => {
+        const { sessionId } = result as { sessionId: string }
+        runScreen(conversationScreen.bind(null, sessionId), sessionsScreen)
+      },
+      (error: unknown) => { failRow(`创建失败: ${error instanceof Error ? error.message : String(error)}`, () => { runScreen(sessionsScreen, inventoryScreen) }) },
     )
   })
-  requireElement<HTMLButtonElement>('#back', HTMLButtonElement).addEventListener('click', () => { void inventoryScreen() })
+  requireElement<HTMLButtonElement>('#back', HTMLButtonElement).addEventListener('click', () => { runScreen(inventoryScreen, resume) })
 }
 
-function escapeHtml(text: string): string {
-  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+function escapeHtml(text: unknown): string {
+  return String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
 }
 
 /** Persistent socket listener while a conversation is open; removed on leave. */
 let chatListener: ((event: MessageEvent) => void) | undefined
+
+/** Run a screen load; a failure renders an error row with a back path instead of hanging. */
+function runScreen(load: () => Promise<void>, back: () => void | Promise<void>): void {
+  void load().catch((error: unknown) => {
+    failRow(error, back)
+  })
+}
+
+/** Render a one-off failure row with a back button. */
+function failRow(message: unknown, back: () => void | Promise<void>): void {
+  render(`<p>${escapeHtml(message instanceof Error ? message.message : String(message))}</p><button id="back">返回</button>`)
+  document.querySelector('#back')?.addEventListener('click', () => { void back() })
+}
+
+/** A stream that never ends must not lock the composer forever. */
+const STREAM_TIMEOUT_MS = 300_000
+
+/** Wire roles are mapped through a whitelist before entering a class attribute. */
+function roleClass(role: string): string {
+  return role === 'user' || role === 'assistant' || role === 'tool' ? role : 'assistant'
+}
 
 /** One conversation: load history, send messages, and stream the assistant reply via `event` pushes. */
 async function conversationScreen(sessionId: string): Promise<void> {
@@ -307,6 +403,9 @@ async function conversationScreen(sessionId: string): Promise<void> {
   const socket = session.socket
   const messages: Array<{ role: 'user' | 'assistant'; text: string } | { role: 'tool'; name: string; error?: string; result?: string }> = []
   let streaming = false
+  let streamTimer: number | undefined
+  /** The session the current stream belongs to; other sessions' pushes are ignored. */
+  let streamSessionId: string | undefined
 
   const history = await request('chat.history', { sessionId }) as { messages: typeof messages }
   messages.push(...history.messages)
@@ -321,7 +420,7 @@ async function conversationScreen(sessionId: string): Promise<void> {
   }
   const statsLine = statsResult.stats === null
     ? ''
-    : `<p class="chat-stats">轮次 ${statsResult.stats.turns} · 步骤 ${statsResult.stats.steps} · 输出 ${statsResult.stats.decodeTokens} tokens</p>`
+    : `<p class="chat-stats">轮次 ${escapeHtml(statsResult.stats.turns)} · 步骤 ${escapeHtml(statsResult.stats.steps)} · 输出 ${escapeHtml(statsResult.stats.decodeTokens)} tokens</p>`
   render(`
     <h1>会话 ${escapeHtml(sessionId.slice(0, 8))}…</h1>
     ${statsLine}
@@ -347,7 +446,7 @@ async function conversationScreen(sessionId: string): Promise<void> {
         const detail = message.result === undefined ? '' : `<br>${escapeHtml(message.result)}`
         return `<p class="chat-tool"><strong>工具 ${escapeHtml(message.name)}</strong>${state}${detail}</p>`
       }
-      return `<p class="chat-${message.role}"><strong>${message.role === 'user' ? '我' : 'dsh'}</strong> ${escapeHtml(message.text)}</p>`
+      return `<p class="chat-${roleClass(message.role)}"><strong>${message.role === 'user' ? '我' : 'dsh'}</strong> ${escapeHtml(message.text)}</p>`
     }).join('')
     log.scrollTop = log.scrollHeight
   }
@@ -362,23 +461,40 @@ async function conversationScreen(sessionId: string): Promise<void> {
     if (message.type !== 'event') return
     const { event: name, payload } = message.payload as {
       event: string
-      payload: { text?: string; code?: string; message?: string }
+      payload: { sessionId?: string; text?: string; code?: string; message?: string }
     }
     if (name === 'chat/start') {
+      // The relay broadcasts every bound client's streams; keep only ours.
+      if (payload.sessionId !== sessionId) return
+      streamSessionId = sessionId
       messages.push({ role: 'assistant', text: '' })
       streaming = true
+      if (streamTimer !== undefined) clearTimeout(streamTimer)
+      streamTimer = window.setTimeout(() => { streaming = false }, STREAM_TIMEOUT_MS)
       renderLog()
     } else if (name === 'chat/chunk' || name === 'chat/done') {
-      const last = messages[messages.length - 1]
+      if (streamSessionId !== sessionId) return
+      let last = messages[messages.length - 1]
+      if (last === undefined || last.role !== 'assistant') {
+        messages.push({ role: 'assistant', text: '' })
+        last = messages[messages.length - 1]
+      }
       if (last !== undefined && last.role === 'assistant') {
         last.text = name === 'chat/done' ? (payload.text ?? last.text) : last.text + (payload.text ?? '')
       }
-      if (name === 'chat/done') streaming = false
+      if (name === 'chat/done') {
+        streaming = false
+        if (streamTimer !== undefined) clearTimeout(streamTimer)
+        streamTimer = undefined
+      }
       renderLog()
     } else if (name === 'chat/error') {
+      if (streamSessionId !== sessionId) return
       const last = messages[messages.length - 1]
       if (last !== undefined && last.role === 'assistant') last.text = `错误: ${payload.message ?? payload.code ?? '未知'}`
       streaming = false
+      if (streamTimer !== undefined) clearTimeout(streamTimer)
+      streamTimer = undefined
       renderLog()
     }
   }
@@ -405,7 +521,7 @@ async function conversationScreen(sessionId: string): Promise<void> {
   requireElement<HTMLButtonElement>('#back', HTMLButtonElement).addEventListener('click', () => {
     if (chatListener !== undefined) socket.removeEventListener('message', chatListener)
     chatListener = undefined
-    void sessionsScreen()
+    runScreen(sessionsScreen, inventoryScreen)
   })
 }
 
@@ -415,10 +531,10 @@ async function settingsScreen(): Promise<void> {
   }
   render(`
     <h1>设置</h1>
-    <pre>${JSON.stringify(result.namespaces, null, 2)}</pre>
+    <pre>${escapeHtml(JSON.stringify(result.namespaces, null, 2))}</pre>
     <button id="back">返回</button>
   `)
-  requireElement<HTMLButtonElement>('#back', HTMLButtonElement).addEventListener('click', () => { void inventoryScreen() })
+  requireElement<HTMLButtonElement>('#back', HTMLButtonElement).addEventListener('click', () => { runScreen(inventoryScreen, resume) })
 }
 
 resume()

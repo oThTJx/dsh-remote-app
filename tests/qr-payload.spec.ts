@@ -14,4 +14,10 @@ describe('parseQrPayload', () => {
     expect(() => parseQrPayload('code=123456')).toThrow(/invalid QR payload/)
     expect(() => parseQrPayload('relay=ws%3A%2F%2Fx')).toThrow(/invalid QR payload/)
   })
+
+  it('rejects non-WebSocket relay schemes and oversized relays', () => {
+    expect(() => parseQrPayload('relay=http%3A%2F%2Fevil.example&code=123456')).toThrow(/invalid QR payload/)
+    expect(() => parseQrPayload('relay=javascript%3Aalert(1)&code=123456')).toThrow(/invalid QR payload/)
+    expect(() => parseQrPayload(`relay=${'a'.repeat(600)}&code=123456`)).toThrow(/invalid QR payload/)
+  })
 })
